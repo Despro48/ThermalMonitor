@@ -5,11 +5,12 @@ import matplotlib.animation as animation
 
 
 # Serial port configuration
-serial_port = 'COM10'  # Replace with your serial port
+serial_port = 'COM19'  # Replace with your serial port
 baud_rate = 921600
 IMAGE_SCALE = 2
 IMAGE_HEIGHT = 24
 IMAGE_WIDTH = 32
+PIXEL_COUNT = IMAGE_HEIGHT * IMAGE_WIDTH
 
 
 # Initialize serial port
@@ -18,9 +19,8 @@ ser.flush()
 
 
 # Initialize temperature array
-temps = np.zeros(IMAGE_HEIGHT * IMAGE_WIDTH)
-max_temp = 0
-min_temp = 500
+temps = np.zeros(PIXEL_COUNT)
+serial_buffer = bytearray()
 
 
 # Create the figure for plotting
@@ -61,35 +61,28 @@ def bilinear_interpolate(image, scale):
 
 
 def read_serial_data():
-    global max_temp, min_temp
-    if ser.in_waiting > 5000:
-        line = ser.read_until(b'\r')
-        if len(line) > 4608:
-            line = line[:4608]
-        split_string = line.decode().strip().split(',')
+    if ser.in_waiting:
+        serial_buffer.extend(ser.read(ser.in_waiting))
 
-        # Update min and max temperatures
-        max_temp = 0
-        min_temp = 50
+    while b'\n' in serial_buffer:
+        line_end = serial_buffer.index(b'\n')
+        line = bytes(serial_buffer[:line_end]).strip()
+        del serial_buffer[:line_end + 1]
 
-        for q in range(768):
-            try:
-                value = float(split_string[q])
-                if value > max_temp:
-                    max_temp = value
-                if value < min_temp:
-                    min_temp = value
-            except (ValueError, IndexError):
-                pass
-        
-        # Map temperatures to colors
-        for q in range(768):
-            try:
-                value = float(split_string[q])
-                mapped_value = np.clip(np.interp(value, [min_temp, max_temp], [160, 360]), 160, 360)
-                temps[q] = mapped_value
-            except (ValueError, IndexError):
-                temps[q] = 0
+        try:
+            values = np.asarray(line.decode('ascii').split(','), dtype=float)
+        except (UnicodeDecodeError, ValueError):
+            continue
+
+        if values.size != PIXEL_COUNT or not np.isfinite(values).all():
+            continue
+
+        min_temp = values.min()
+        max_temp = values.max()
+        if min_temp == max_temp:
+            temps[:] = 260
+        else:
+            temps[:] = np.interp(values, [min_temp, max_temp], [160, 360])
 
 
 def update_heatmap(*args):
