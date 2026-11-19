@@ -7,13 +7,15 @@ import matplotlib.animation as animation
 
 
 # Serial port configuration
-serial_port = 'COM19'  # Replace with your serial port
+serial_port = '/dev/ttyUSB0'  # Replace with your serial port
 baud_rate = 921600
 IMAGE_SCALE = 2
 IMAGE_HEIGHT = 24
 IMAGE_WIDTH = 32
 PIXEL_COUNT = IMAGE_HEIGHT * IMAGE_WIDTH
-PACKET_PAYLOAD_MAX = 253
+FRAME_BYTES = PIXEL_COUNT * 2
+LORA_PAYLOAD = 252
+PACKET_PAYLOAD_MAX = 2048
 SERIAL_PACKET_PREFIX = b'PKT,'
 TEMP_MIN_C = 20.0
 TEMP_MAX_C = 35.0
@@ -34,9 +36,15 @@ ser.flush()
 temps = np.full(PIXEL_COUNT, np.nan)
 serial_buffer = bytearray()
 packet_total = None
-frame_buffer = bytearray()
-packet_lengths = []
-packet_seen = []
+chunks = []
+frame_done = False
+last_idx = -1
+
+
+def expected_values(idx):
+    start = idx * LORA_PAYLOAD
+    end = min((idx + 1) * LORA_PAYLOAD, FRAME_BYTES)
+    return end // 2 - start // 2
 
 
 # Create the figure for plotting
@@ -76,7 +84,7 @@ def bilinear_interpolate(image, scale):
 
 
 def read_serial_data():
-    global packet_total, frame_buffer, packet_lengths, packet_seen
+    global packet_total, chunks, frame_done, last_idx
 
     if ser.in_waiting:
         serial_buffer.extend(ser.read(ser.in_waiting))
@@ -114,32 +122,27 @@ def read_serial_data():
 
         payload = bytes(serial_buffer[header_end + 1:packet_end])
         del serial_buffer[:packet_end]
-        # print(f"RX idx={idx}/{total} length={payload_len}", flush=True)
+        print(f"RX idx={idx}/{total} length={payload_len}", flush=True)
 
-        if packet_total != total:
+        if idx <= last_idx or packet_total != total:
             packet_total = total
-            frame_buffer = bytearray(total * PACKET_PAYLOAD_MAX)
-            packet_lengths = [0] * total
-            packet_seen = [False] * total
+            chunks = [None] * total
+            frame_done = False
+        last_idx = idx
 
-        offset = idx * PACKET_PAYLOAD_MAX
-        frame_buffer[offset:offset + payload_len] = payload
-        packet_lengths[idx] = payload_len
-        packet_seen[idx] = True
-
-        contiguous_len = 0
-        for chunk_idx, seen in enumerate(packet_seen):
-            if not seen:
-                break
-            chunk_len = packet_lengths[chunk_idx]
-            if chunk_idx < total - 1 and chunk_len != PACKET_PAYLOAD_MAX:
-                break
-            contiguous_len = chunk_idx * PACKET_PAYLOAD_MAX + chunk_len
-
-        if contiguous_len == 0:
+        chunks[idx] = payload
+        if frame_done or sum(c is not None for c in chunks) < total - 1:
             continue
+        frame_done = True
 
-        raw = bytes(frame_buffer[:contiguous_len])
+        parts = []
+        for chunk_idx, chunk in enumerate(chunks):
+            if chunk is None:
+                parts.append(b'nan,' * expected_values(chunk_idx))
+            else:
+                parts.append(chunk)
+        raw = b''.join(parts)
+
         fields = raw.split(b',')
         if raw.endswith(b'\n'):
             fields[-1] = fields[-1].strip()
@@ -151,10 +154,8 @@ def read_serial_data():
             try:
                 value = float(field)
             except ValueError:
-                break
-            if not np.isfinite(value):
-                break
-            values.append(value)
+                continue
+            values.append(value if np.isfinite(value) else np.nan)
 
         if not values:
             continue
@@ -180,10 +181,13 @@ def update_heatmap(*args):
             TEMP_MAX_C += DYNAMIC_RANGE_SMOOTHING * (target_max - TEMP_MAX_C)
             heatmap.set_clim(TEMP_MIN_C, TEMP_MAX_C)
 
+    print(f"DRAW finite={np.count_nonzero(np.isfinite(image))}", flush=True)
     heatmap.set_array(bilinear_interpolate(image, IMAGE_SCALE))
     return heatmap,
 
 
-ani = animation.FuncAnimation(fig, update_heatmap, interval=10, cache_frame_data=False)
-
+plt.ion()
 plt.show()
+while True:
+    update_heatmap()
+    plt.pause(0.01)
